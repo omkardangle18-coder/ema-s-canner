@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EMA 35 / 200 · 3M Crossover Scanner</title>
+<style>
+  :root {
+    --bg:#0b0f14; --panel:#131a22; --line:#22303d; --text:#e6edf3; --muted:#8b98a5;
+    --buy:#16c784; --sell:#ff5c6c; --warn:#f5b642; --err:#ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  header { position:sticky; top:0; z-index:5; background:var(--bg); border-bottom:1px solid var(--line);
+           padding:12px 16px; display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; }
+  h1 { font-size:16px; margin:0; }
+  .meta { color:var(--muted); font-size:12px; margin-top:2px; }
+  .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .pill { padding:4px 10px; border-radius:999px; font-size:12px; font-weight:600; background:var(--panel); color:var(--muted); }
+  .pill.live { background:rgba(22,199,132,.15); color:var(--buy); }
+  .pill.warn { background:rgba(245,182,66,.15); color:var(--warn); }
+  .pill.down { background:rgba(255,107,107,.15); color:var(--err); }
+  button { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:8px;
+           padding:8px 12px; font-size:13px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  main { padding:12px 16px 40px; max-width:1100px; margin:0 auto; }
+  .banner { display:none; padding:10px 12px; border-radius:8px; margin-bottom:12px;
+            background:rgba(245,182,66,.12); color:var(--warn); font-size:13px; }
+  .banner.show { display:block; }
+  .grid { display:grid; gap:16px; grid-template-columns:1fr; }
+  @media (min-width:860px) { .grid { grid-template-columns:1fr 1fr; } }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; margin-bottom:16px; }
+  section h2 { margin:0; padding:10px 14px; font-size:14px; display:flex; justify-content:space-between; gap:8px; }
+  h2.buy { color:var(--buy); } h2.sell { color:var(--sell); }
+  table { width:100%; border-collapse:collapse; }
+  th, td { padding:9px 12px; text-align:left; border-top:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  .sig { font-weight:700; padding:2px 8px; border-radius:6px; font-size:12px; }
+  .sig.BUY { background:rgba(22,199,132,.18); color:var(--buy); }
+  .sig.SELL { background:rgba(255,92,108,.18); color:var(--sell); }
+  tr.aged { opacity:.55; }
+  .tag { color:var(--buy); font-size:11px; margin-left:6px; font-weight:600; }
+  .empty { padding:18px 14px; color:var(--muted); }
+  .row { padding:9px 14px; border-top:1px solid var(--line); display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+  .ok { color:var(--buy); } .bad { color:var(--err); }
+  @media (max-width:560px) {
+    table, tbody, tr { display:block; }
+    thead { display:none; }
+    tr { border-top:1px solid var(--line); padding:6px 0; }
+    tr:first-child { border-top:none; }
+    td { display:flex; justify-content:space-between; gap:12px; white-space:normal; border:none; padding:5px 12px; }
+    td::before { content:attr(data-label); color:var(--muted); font-size:12px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>EMA 35 / EMA 200 · 3M Crossover Scanner</h1>
+    <div class="meta" id="meta">Connecting…</div>
+  </div>
+  <div class="controls">
+    <span class="pill" id="status">—</span>
+    <button id="soundBtn">🔕 Enable sound</button>
+    <button id="refreshBtn">↻ Refresh</button>
+  </div>
+</header>
+
+<main>
+  <div class="banner" id="banner"></div>
+
+  <div class="grid">
+    <section>
+      <h2 class="buy"><span>BUY · EMA 35 crossed above EMA 200</span><span id="buyCount">0</span></h2>
+      <div id="buy"></div>
+    </section>
+    <section>
+      <h2 class="sell"><span>SELL · EMA 35 crossed below EMA 200</span><span id="sellCount">0</span></h2>
+      <div id="sell"></div>
+    </section>
+  </div>
+
+  <section>
+    <h2><span>Data sources &amp; symbol status</span></h2>
+    <div id="symbols"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const POLL_MS = 10000;
+let serverOffset = 0;       // server clock minus browser clock
+let lastState = null;
+let seenIds = null;         // null until first successful render (no sound on page load)
+let soundOn = false;
+let audioCtx = null;
+
+const nowMs = () => Date.now() + serverOffset;
+const ageMin = ms => Math.max(0, Math.floor((nowMs() - ms) / 60000));
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtTime = ms => new Date(ms).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+
+function setStatus(kind, text) {
+  const el = $("status");
+  el.className = "pill " + (kind === "live" ? "live" : kind === "warn" ? "warn" : kind === "down" ? "down" : "");
+  el.textContent = text;
+}
+
+function playBeep(side) {
+  if (!soundOn) return;
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = "sine";
+    o.frequency.value = side === "BUY" ? 880 : 440;
+    g.gain.value = 0.25;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.35);
+  } catch (e) { /* audio unavailable */ }
+}
+
+function table(rows, maxAge) {
+  if (!rows.length) return `<div class="empty">No confirmed crossovers in the last ${maxAge} min.</div>`;
+  let h = `<table><thead><tr>
+    <th>Symbol</th><th>Signal</th><th>Timeframe</th><th>Crossover Time</th><th>Minutes Ago</th><th>Source</th>
+    </tr></thead><tbody>`;
+  for (const r of rows) {
+    const m = ageMin(r.crossover_ms);
+    h += `<tr class="${m > 10 ? "aged" : ""}">
+      <td data-label="Symbol"><b>${esc(r.symbol)}</b></td>
+      <td data-label="Signal"><span class="sig ${r.side}">${r.side}</span></td>
+      <td data-label="Timeframe">3M</td>
+      <td data-label="Crossover">${fmtTime(r.crossover_ms)}</td>
+      <td data-label="Minutes ago">${m} min${m <= 1 ? '<span class="tag">JUST CONFIRMED</span>' : ""}</td>
+      <td data-label="Source">${esc(r.exchange)}</td>
+    </tr>`;
+  }
+  return h + "</tbody></table>";
+}
+
+function render() {
+  const s = lastState;
+  if (!s) return;
+
+  const symbols = Object.values(s.symbols);
+  const okCount = symbols.filter(x => x.ok).length;
+  const scanAgeSec = s.last_scan_ms ? (nowMs() - s.last_scan_ms) / 1000 : Infinity;
+
+  if (!s.last_scan_ms) setStatus("warn", "Waiting for first scan");
+  else if (okCount === 0) setStatus("down", "Live data UNAVAILABLE");
+  else if (scanAgeSec > s.scan_interval_sec * 3) setStatus("warn", "Data stale");
+  else if (okCount < symbols.length) setStatus("warn", `Partial data ${okCount}/${symbols.length}`);
+  else setStatus("live", "LIVE");
+
+  $("meta").textContent = s.last_scan_ms
+    ? `Last scan ${new Date(s.last_scan_ms).toLocaleTimeString()} · auto every ${s.scan_interval_sec}s · signals older than ${s.max_signal_age_min} min removed`
+    : "No scan completed yet";
+
+  const failed = symbols.filter(x => !x.ok);
+  const banner = $("banner");
+  if (failed.length) {
+    banner.className = "banner show";
+    banner.textContent = "No live data for: " + failed.map(x => `${x.symbol} (${x.error})`).join(" · ");
+  } else {
+    banner.className = "banner";
+  }
+
+  const sigs = s.signals.filter(x => ageMin(x.crossover_ms) <= s.max_signal_age_min);
+
+  // Sound for newly confirmed signals (not on the first render after page load)
+  const ids = new Set(sigs.map(x => x.id));
+  if (seenIds !== null) for (const x of sigs) if (!seenIds.has(x.id)) playBeep(x.side);
+  seenIds = ids;
+
+  const buys = sigs.filter(x => x.side === "BUY");
+  const sells = sigs.filter(x => x.side === "SELL");
+  $("buyCount").textContent = buys.length;
+  $("sellCount").textContent = sells.length;
+  $("buy").innerHTML = table(buys, s.max_signal_age_min);
+  $("sell").innerHTML = table(sells, s.max_signal_age_min);
+
+  $("symbols").innerHTML = symbols.length
+    ? symbols.map(x => `<div class="row">
+        <span><b>${esc(x.symbol)}</b> <span class="meta">${esc(x.exchange)}</span></span>
+        <span class="${x.ok ? "ok" : "bad"}">${x.ok
+          ? "Live · last closed candle " + new Date(x.last_candle_close_ms).toLocaleString()
+          : "Unavailable: " + esc(x.error)}</span>
+      </div>`).join("")
+    : `<div class="empty">No symbols configured.</div>`;
+}
+
+async function load() {
+  try {
+    const r = await fetch("/api/state", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const s = await r.json();
+    serverOffset = s.server_time_ms - Date.now();
+    lastState = s;
+    render();
+  } catch (e) {
+    setStatus("down", "Backend unreachable");
+    $("meta").textContent = "Cannot reach app.py. Is the server running?";
+  }
+}
+
+async function manualRefresh() {
+  const before = lastState ? lastState.last_scan_ms : null;
+  $("refreshBtn").disabled = true;
+  $("refreshBtn").textContent = "Scanning…";
+  try { await fetch("/api/refresh", { method: "POST" }); } catch (e) {}
+  for (let i = 0; i < 45; i++) {          // wait up to ~90 s for the scan to finish
+    await new Promise(r => setTimeout(r, 2000));
+    await load();
+    if (lastState && lastState.last_scan_ms !== before) break;
+  }
+  $("refreshBtn").disabled = false;
+  $("refreshBtn").textContent = "↻ Refresh";
+}
+
+$("refreshBtn").onclick = manualRefresh;
+
+$("soundBtn").onclick = () => {
+  soundOn = !soundOn;
+  $("soundBtn").textContent = soundOn ? "🔔 Sound on" : "🔕 Enable sound";
+  if (soundOn) {
+    // Browsers require a user gesture before audio can play
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx.resume();
+    playBeep("BUY");
+  }
+};
+
+load();
+setInterval(load, POLL_MS);
+setInterval(render, 15000);   // keeps "minutes ago" and ageing current between polls
+</script>
+</body>
+</html>
